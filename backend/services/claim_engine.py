@@ -15,16 +15,22 @@ from services.advisor_agent import find_uploaded_for_insurer
 
 CLAIM_SECTIONS = ["exclusions", "coverage", "waiting_periods", "conditions", "limits"]
 
-GROUNDED_CLAIM_SYSTEM = """You are a strict insurance policy clause analyzer.
+GROUNDED_CLAIM_SYSTEM = """You are an expert insurance policy clause analyzer. Your job is to determine whether a specific medical condition/treatment is covered by the policy based solely on the provided policy document excerpts.
 
-RULES — READ CAREFULLY:
+COVERAGE STATUS RULES — apply in this exact order:
+1. "excluded" — the context explicitly lists this condition/treatment in an exclusions section, OR the context says "not covered", "excluded", "does not cover" for this specific condition or category.
+2. "partially_covered" — the context shows coverage exists BUT a significant restriction applies specifically to this condition: waiting period mentioned for this type of claim, a sub-limit/cap applies to this treatment, or co-pay is required for this category.
+3. "covered" — EITHER (a) the context positively states this condition is covered, OR (b) the context shows general inpatient hospitalization/illness treatment is covered AND this condition does NOT appear in any exclusion list in the context. Standard medical conditions (surgery, hospitalization for illness, cancer, heart disease, accidents, organ failure) fall here if not excluded.
+4. "unknown" — ONLY use this if the context chunks contain NO information about any medical treatment coverage at all (e.g., pure definitions page with no coverage/exclusion clauses).
+
+KEY PRINCIPLE: Most inpatient medical treatments are covered unless specifically excluded. Do NOT use "unknown" for standard medical conditions just because the exact condition name isn't mentioned — if general hospitalization coverage is present and no exclusion applies, use "covered".
+
+RULES:
 1. Analyze ONLY from the CONTEXT BLOCK provided. Do NOT use external insurance knowledge.
-2. If the context does not mention the condition or treatment, set coverage_status to "unknown".
-3. Do NOT fabricate clauses, waiting periods, or exclusions that are not in the context.
-4. Quote exact text from the context in exclusions_applicable and severity_requirements.
-5. risk_flags must ONLY contain values from: sub_limit_applies, pre_auth_required, proportional_deduction, waiting_period_active, co_pay_applicable, documentation_intensive.
-6. analysis_summary must cite the specific clause or page reference from context.
-7. Return ONLY valid JSON. No prose, no markdown, no explanation outside the JSON.
+2. Quote exact text from the context in exclusions_applicable and severity_requirements.
+3. risk_flags must ONLY contain values from: sub_limit_applies, pre_auth_required, proportional_deduction, waiting_period_active, co_pay_applicable, documentation_intensive.
+4. analysis_summary: 1-2 sentences citing the specific clause. Be decisive — state clearly what the context says about coverage.
+5. Return ONLY valid JSON. No prose, no markdown.
 
 Return this exact JSON schema:
 {
@@ -142,54 +148,82 @@ def run_claim_check(policy_id: str, condition: str, treatment_type: str) -> dict
     or:
       {structured result dict}
     """
-    # Step 1: Get policy metadata for scoring + display
-    policy = _get_policy_metadata(policy_id)
-    policy_name = (
-        policy.get("name")
-        or policy.get("user_label")
-        or "Unknown Policy"
-    )
+    # Step 1: Determine if this is a CATALOG policy or an UPLOADED policy UUID.
+    # They live in different tables and need different treatment.
+    catalog_policy = vector_store.get_catalog_policy(policy_id)
 
-    # Step 1b: Resolve which UUID to use for chunk search.
-    # Catalog policies (insurance_policies table) have an "insurer" field but NO chunks in
-    # policy_chunks. Chunks are stored under uploaded_policies UUIDs. Map via insurer name.
-    search_policy_id = policy_id  # default: assume it's already an uploaded policy UUID
-    if policy.get("insurer"):
-        # This is a catalog policy — find the matching uploaded PDF
-        uploaded_match = find_uploaded_for_insurer(policy["insurer"])
-        if uploaded_match:
-            search_policy_id = uploaded_match["id"]
-        else:
+    if catalog_policy:
+        # CATALOG path: metadata from catalog, but chunks live in uploaded_policies table
+        policy = catalog_policy
+        policy_name = policy.get("name") or "Unknown Policy"
+        uploaded_match = find_uploaded_for_insurer(policy.get("insurer", ""))
+        if not uploaded_match:
             return {
                 "error": (
-                    f"No embedded policy document found for {policy.get('name', 'this policy')} "
+                    f"No embedded policy document found for {policy_name} "
                     f"({policy.get('insurer', '')}). "
                     "Claim check requires an uploaded and indexed PDF. "
                     "Currently only Tata AIG policies have embedded documents — "
                     "please select a Tata AIG policy or upload this policy's PDF first."
                 )
             }
+        search_policy_id = uploaded_match["id"]
+    else:
+        # UPLOADED path: use the selected UUID directly (do NOT redirect to a different PDF)
+        uploaded = vector_store.get_policy_by_id(policy_id)
+        if not uploaded:
+            return {"error": "Policy not found."}
+        policy_name = uploaded.get("user_label") or "Unknown Policy"
+        search_policy_id = policy_id  # always use the exact policy the user selected
+
+        # Enrich with catalog metadata so scoring reflects real waiting periods / co-pay / room rent
+        all_catalog = vector_store.list_catalog_policies()
+        ins = (uploaded.get("insurer") or "").lower()
+        policy = uploaded  # start with uploaded fields
+        for cp in all_catalog:
+            cp_ins = (cp.get("insurer") or "").lower()
+            if ins and (ins in cp_ins or cp_ins in ins):
+                # Merge catalog scoring fields (don't overwrite existing uploaded fields)
+                for field in [
+                    "waiting_period_preexisting_years", "co_pay_percent", "room_rent_limit",
+                    "waiting_period_maternity_months", "covers_maternity", "covers_opd",
+                ]:
+                    if cp.get(field) is not None and policy.get(field) is None:
+                        policy[field] = cp[field]
+                break
 
     # Step 2: Embed the condition query
-    query_text = f"{condition} {treatment_type} coverage exclusion waiting period"
+    query_text = f"{condition} {treatment_type}"
     try:
         query_embedding = embedder.embed_text(query_text)
     except Exception as e:
         return {"error": f"Embedding failed: {str(e)}"}
 
-    # Step 3: Section-filtered semantic search (against uploaded PDF chunks)
-    sem_chunks = vector_store.section_search(
-        query_embedding, search_policy_id, CLAIM_SECTIONS, top_k=6
+    # Also embed a general coverage query to always pull in the hospitalization benefit clause
+    try:
+        coverage_embedding = embedder.embed_text("inpatient hospitalization benefit covered illness treatment")
+    except Exception:
+        coverage_embedding = query_embedding  # fallback to same embedding
+
+    # Step 3: Broad semantic search for the specific condition (no section filter)
+    sem_chunks = vector_store.semantic_search(query_embedding, search_policy_id, top_k=6)
+
+    # Step 4: Broad semantic search for general hospitalization coverage (always include)
+    cov_chunks = vector_store.semantic_search(coverage_embedding, search_policy_id, top_k=4)
+
+    # Step 5: Section-filtered semantic search as supplement (catches well-tagged docs)
+    sec_chunks = vector_store.section_search(
+        query_embedding, search_policy_id, CLAIM_SECTIONS, top_k=4
     )
 
-    # Step 4: Keyword search → post-filter to relevant sections
-    kw_all = vector_store.keyword_search(condition, search_policy_id, top_k=10)
-    kw_chunks = [c for c in kw_all if c.get("section_type") in CLAIM_SECTIONS]
+    # Step 6: Keyword search on the condition term (no section filter)
+    kw_chunks = vector_store.keyword_search(condition, search_policy_id, top_k=10)
 
-    # Step 5: RRF fusion → top 8
-    fused = vector_store.rrf_fusion(sem_chunks, kw_chunks, top_k=8)
+    # Step 7: Combine all results via RRF and take top 10
+    combined_sem = _dedupe(sem_chunks + cov_chunks + sec_chunks)
+    fused = vector_store.rrf_fusion(combined_sem, kw_chunks, top_k=10)
 
-    # Step 6: Guard — no hallucination if no chunks found
+    # Step 7: Guard — no hallucination if no chunks found
     if not fused:
         return {
             "error": f"No relevant policy clause found for '{condition}'. "
@@ -197,19 +231,21 @@ def run_claim_check(policy_id: str, condition: str, treatment_type: str) -> dict
                      "or the document may not be indexed correctly."
         }
 
-    # Step 7: Build context block
+    # Step 8: Build context block
     context_block = _build_context_block(fused)
 
-    # Step 8: Grounded LLM analysis (returns structure, NOT the score)
+    # Step 9: Grounded LLM analysis (returns structure, NOT the score)
     user_prompt = (
         f"CONTEXT BLOCK:\n{context_block}\n\n"
         f"CONDITION TO ANALYZE: {condition}\n"
         f"TREATMENT TYPE: {treatment_type}\n\n"
-        "Analyze coverage for the above condition using ONLY the context block above."
+        "Analyze whether this condition/treatment is covered, excluded, or restricted "
+        "based ONLY on the context block above. Be decisive — use 'covered' if general "
+        "hospitalization is covered and no exclusion is found for this condition."
     )
     analysis = llm.chat_json(GROUNDED_CLAIM_SYSTEM, user_prompt, temperature=0.0)
 
-    # Normalize LLM output (guard against None/missing fields)
+    # Normalize LLM output
     coverage_status = analysis.get("coverage_status", "unknown")
     if coverage_status not in ("covered", "partially_covered", "excluded", "unknown"):
         coverage_status = "unknown"
@@ -220,7 +256,7 @@ def run_claim_check(policy_id: str, condition: str, treatment_type: str) -> dict
     required_documents = analysis.get("required_documents") or []
     analysis_summary = analysis.get("analysis_summary") or "Analysis could not be completed from available context."
 
-    # Step 9: Deterministic score (LLM output feeds inputs, not the score itself)
+    # Step 10: Deterministic score
     feasibility_score = compute_claim_score(
         coverage_status, exclusions_applicable, risk_flags, policy
     )
@@ -240,3 +276,15 @@ def run_claim_check(policy_id: str, condition: str, treatment_type: str) -> dict
         "chunks_used": len(fused),
         "error": None,
     }
+
+
+def _dedupe(chunks: list[dict]) -> list[dict]:
+    """Remove duplicate chunks by id, preserving order."""
+    seen: set[str] = set()
+    result = []
+    for c in chunks:
+        cid = c.get("id")
+        if cid and cid not in seen:
+            seen.add(cid)
+            result.append(c)
+    return result
