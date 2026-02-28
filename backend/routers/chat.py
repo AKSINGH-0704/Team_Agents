@@ -22,6 +22,13 @@ from services import llm
 from services.vector_store import get_client
 from services.skills import PolicyRanker, hard_filter
 from services.vector_store import list_catalog_policies
+from services.advisor_agent import (
+    classify_intent,
+    find_uploaded_for_insurer,
+    get_rag_insights,
+    explain_term,
+    get_chat_reply,
+)
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 ranker = PolicyRanker()
@@ -29,26 +36,6 @@ ranker = PolicyRanker()
 CONTEXT_SUMMARY_SYSTEM = """Summarize this insurance advisor conversation in 3-4 sentences.
 Capture: what coverage the user needs, their budget, family size, and any pre-existing conditions mentioned.
 Return ONLY the summary text, no JSON."""
-
-CHAT_SYSTEM = """You are a friendly health insurance advisor for Indian health insurance policies.
-Analyze the conversation history and decide if you have enough information to recommend policies.
-Return ONLY valid JSON:
-{
-  "ready": true or false,
-  "follow_up": "ONE specific follow-up question if not ready, null if ready",
-  "extracted": {
-    "needs": ["maternity", "opd", "mental_health", "ayush", "dental", "critical_illness"],
-    "budget_max": null or annual premium in INR as a number,
-    "members": null or number of family members,
-    "preexisting_conditions": ["diabetes", "hypertension"],
-    "preferred_type": null or "individual" or "family_floater" or "senior_citizen"
-  }
-}
-Rules:
-- Set ready=true if user mentioned ANY of: a health coverage need, a medical condition, a budget, or a plan type
-- Set ready=false ONLY for completely vague messages like "hi", "help me", "insurance", "hello"
-- If ready=false, ask ONE warm and specific follow-up question about what they need
-- Extract whatever partial info you can even from incomplete queries"""
 
 CHAT_INTRO_SYSTEM = """You are a warm health insurance advisor. Write a friendly 1-2 sentence response acknowledging what the user asked for, right before showing their policy recommendations. Be specific about what you understood. Do not say "Great!" or "Sure!" — be natural.
 Return ONLY valid JSON: {"message": "your response here"}"""
@@ -146,54 +133,101 @@ def _maybe_summarize(full_context: str) -> str:
 
 def _process_message(content: str, db_messages: list[dict], session_context: dict) -> dict:
     """
-    Core AI response logic.
-    Returns structured response dict with type, message, optional policies.
+    3-mode conversational advisor (mirrors discovery.py /discover/chat logic).
+      GATHER  — asks smart follow-up questions until all 3 essential fields present
+      EXPLAIN — explains insurance terms grounded in actual uploaded PDF text
+      RECOMMEND — hard filter + weighted rank + RAG insights from PDF for top 3
     """
     context_str = _build_context_string(db_messages)
     context_str = _maybe_summarize(context_str)
 
-    result = llm.chat_json(CHAT_SYSTEM, f"Conversation:\n{context_str}")
+    # Classify intent and extract requirements from full conversation
+    intent_result = classify_intent(context_str)
+    intent = intent_result.get("intent", "gather_info")
+    extracted = intent_result.get("extracted") or {}
+    extracted["needs"] = extracted.get("needs") or []
+    extracted["preexisting_conditions"] = extracted.get("preexisting_conditions") or []
 
-    if not result.get("ready", False):
-        follow_up = (
-            result.get("follow_up")
-            or "Could you tell me your health coverage needs, annual budget, and how many family members need coverage?"
+    # MODE GATHER: any essential field (budget / members / needs) missing
+    missing_any = (
+        not intent_result.get("has_budget")
+        or not intent_result.get("has_members")
+        or not intent_result.get("has_needs_or_conditions")
+    )
+    if intent == "gather_info" or (missing_any and intent not in ("explain_term", "explain_policy", "chat_reply")):
+        question = (
+            intent_result.get("next_question")
+            or "Could you tell me your health coverage needs, annual budget, and family size?"
         )
-        return {"type": "question", "message": follow_up}
+        return {"type": "question", "message": question}
 
-    requirements = result.get("extracted") or {}
-    requirements["needs"] = requirements.get("needs") or []
-    requirements["preexisting_conditions"] = requirements.get("preexisting_conditions") or []
+    # MODE CHAT: conversational / educational reply
+    if intent == "chat_reply":
+        session_policy_ids = session_context.get("last_recommended_uploaded_ids", [])
+        reply = get_chat_reply(content, session_policy_ids)
+        return {"type": "chat", "message": reply["answer"]}
 
+    # MODE EXPLAIN: user asked about an insurance term or specific policy
+    if intent in ("explain_term", "explain_policy"):
+        term = intent_result.get("term_to_explain") or intent_result.get("policy_name_asked")
+        if term:
+            # Retrieve uploaded policy IDs stored in session context from last recommendation
+            session_policy_ids = session_context.get("last_recommended_uploaded_ids", [])
+            result = explain_term(term, session_policy_ids)
+            return {
+                "type": "explanation",
+                "message": result.get("explanation", ""),
+                "example": result.get("example"),
+                "citation": result.get("citation"),
+                "policy_name": result.get("policy_name"),
+                "found": result.get("found", False),
+            }
+
+    # MODE RECOMMEND: all 3 essential fields present
     all_policies = list_catalog_policies()
-    filtered = hard_filter(all_policies, requirements)
+    filtered = hard_filter(all_policies, extracted)
 
     if not filtered:
         return {
             "type": "no_results",
             "message": NO_RESULTS_MESSAGE,
-            "extracted_requirements": requirements,
+            "extracted_requirements": extracted,
             "policies": [],
             "total_found": 0,
         }
 
-    ranked = ranker.rank(requirements, filtered)
+    ranked = ranker.rank(extracted, filtered)
+    top_policies = ranked[:6]
+    user_needs = extracted["needs"] + extracted["preexisting_conditions"]
+
+    # RAG enrichment: top 3 policies → find matching uploaded PDF → surface hidden traps
+    uploaded_ids: list[str] = []
+    for policy in top_policies[:3]:
+        uploaded = find_uploaded_for_insurer(policy.get("insurer", ""))
+        if uploaded:
+            insights = get_rag_insights(uploaded["id"], user_needs)
+            policy["rag_insights"] = insights
+            policy["uploaded_policy_id"] = uploaded["id"]
+            uploaded_ids.append(uploaded["id"])
+        else:
+            policy["rag_insights"] = {"available": False}
 
     last_user = next(
         (m["content"] for m in reversed(db_messages) if m["role"] == "user"), content
     )
     intro_result = llm.chat_json(
         CHAT_INTRO_SYSTEM,
-        f"User asked: {last_user}\nExtracted needs: {requirements}",
+        f"User asked: {last_user}\nExtracted needs: {extracted}",
     )
     message = intro_result.get("message") or "Here are the best policies matching your needs:"
 
     return {
         "type": "results",
         "message": message,
-        "extracted_requirements": requirements,
-        "policies": ranked[:6],
+        "extracted_requirements": extracted,
+        "policies": top_policies,
         "total_found": len(ranked),
+        "uploaded_policy_ids": uploaded_ids,
     }
 
 
@@ -272,16 +306,20 @@ async def send_message(session_id: str, req: SendMessageRequest):
     }
     persisted = _insert_message(session_id, "assistant", ai_response["message"], metadata)
 
-    # Update session context with any extracted state
+    # Update session context with extracted state + uploaded policy IDs for term lookups
+    updated_context = {**session.get("context", {})}
     extracted = ai_response.get("extracted_requirements", {})
     if extracted:
-        updated_context = {**session.get("context", {})}
         if extracted.get("budget_max"):
             updated_context["budget"] = extracted["budget_max"]
         if extracted.get("preexisting_conditions"):
             updated_context["diseases"] = extracted["preexisting_conditions"]
         if extracted.get("members"):
             updated_context["family_size"] = extracted["members"]
+    # Store uploaded PDF IDs so future explain_term calls can look up the right documents
+    if ai_response.get("uploaded_policy_ids"):
+        updated_context["last_recommended_uploaded_ids"] = ai_response["uploaded_policy_ids"]
+    if updated_context != session.get("context", {}):
         _update_session(session_id, updated_context)
 
     return {

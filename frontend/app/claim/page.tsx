@@ -424,6 +424,27 @@ export default function ClaimPage() {
                     <p className="text-xs text-blue-700 font-medium">{gap.recommendation}</p>
                   </div>
                 ))}
+
+                {/* Hidden conditions from actual policy PDF (RAG-grounded) */}
+                {result.hidden_conditions?.length > 0 && (
+                  <div className="border border-orange-200 bg-orange-50 rounded-2xl p-4">
+                    <div className="text-sm font-bold text-orange-700 mb-2 flex items-center gap-1.5">
+                      <AlertTriangle className="w-4 h-4" />
+                      Hidden Conditions Found in Policy Document
+                    </div>
+                    {result.hidden_conditions.map((trap: any, i: number) => (
+                      <div key={i} className="text-sm text-orange-800 mb-2">
+                        <span className="font-semibold capitalize">
+                          {trap.type?.replace(/_/g, " ")}:{" "}
+                        </span>
+                        {trap.plain_english}
+                        {trap.impact && (
+                          <span className="text-orange-600"> — {trap.impact}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>

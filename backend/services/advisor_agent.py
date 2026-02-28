@@ -19,7 +19,7 @@ Essential fields for a good policy recommendation (ALL 3 required):
 
 Return ONLY valid JSON — no prose, no markdown:
 {
-  "intent": "gather_info | recommend_policies | explain_term | explain_policy | refine_results",
+  "intent": "gather_info | recommend_policies | explain_term | explain_policy | refine_results | chat_reply",
   "has_budget": true or false,
   "has_members": true or false,
   "has_needs_or_conditions": true or false,
@@ -31,16 +31,20 @@ Return ONLY valid JSON — no prose, no markdown:
     "budget_max": null,
     "members": null,
     "preexisting_conditions": [],
-    "preferred_type": null
+    "preferred_type": null,
+    "sum_insured_min": null
   }
 }
 
 Intent classification rules:
-- "gather_info": ANY of the 3 essential fields is missing → ask next_question
-- "recommend_policies": ALL 3 fields present AND user wants policy recommendations
-- "explain_term": user asks to explain/define an insurance term (room rent, co-pay, NCB, waiting period, cashless, sub-limit, TPA, etc.)
-- "explain_policy": user asks for more detail about a specific policy by name
-- "refine_results": user wants to change/narrow results already shown (change budget, add need, etc.)
+- "chat_reply": user is greeting, making small talk, asking a general educational insurance question, asking for advice without wanting specific recommendations, or saying something conversational (hi, thanks, what is health insurance, tell me about waiting periods, which plan is best for elderly, etc.) — answer naturally in text
+- "gather_info": user wants policy recommendations but ANY of the 3 essential fields is missing → ask next_question
+- "recommend_policies": ALL 3 fields present AND user clearly wants policy recommendations
+- "explain_term": user asks to explain/define a specific insurance term (room rent, co-pay, NCB, waiting period, cashless, sub-limit, TPA, daycare, etc.)
+- "explain_policy": user asks for more detail about a specific named policy
+- "refine_results": user wants to change/narrow results already shown
+
+chat_reply examples: "hi", "hello", "thanks", "what is health insurance?", "which type of plan is better?", "tell me about waiting periods", "is maternity coverage worth it?", "what should I look for in a policy?", "are there any good plans for senior citizens?"
 
 next_question priority (ask ONLY ONE at a time):
   1. If no needs_or_conditions → "What specific health coverage do you need? For example: maternity, diabetes management, OPD visits, or a critical illness plan?"
@@ -49,7 +53,8 @@ next_question priority (ask ONLY ONE at a time):
 
 Budget extraction: treat "10k", "15,000", "₹20k/yr", "under 12000 per year" all as budget_max numbers.
 Members extraction: "just me" = 1, "me and my wife" = 2, "family of 4" = 4, "self and 2 kids" = 3.
-Needs extraction: map to canonical values: maternity, opd, mental_health, ayush, dental, critical_illness, restoration, ncb."""
+Needs extraction: map to canonical values: maternity, opd, mental_health, ayush, dental, critical_illness, restoration, ncb.
+Sum insured extraction: "₹10L coverage", "10 lakh cover", "minimum 5L" → sum_insured_min as integer in INR."""
 
 
 RAG_INSIGHTS_SYSTEM = """You are analyzing health insurance policy clauses to find hidden conditions and key facts.
@@ -272,6 +277,58 @@ def explain_term(term: str, session_policy_ids: list[str]) -> dict:
 
     # No grounded explanation found in any recommended policy
     return _not_found(term)
+
+
+CHAT_REPLY_SYSTEM = """You are a knowledgeable, friendly health insurance advisor in India.
+
+RULES:
+1. If a CONTEXT BLOCK is provided, base your answer on it — quote specific clauses or numbers where helpful.
+2. If no context, use accurate general knowledge about Indian health insurance.
+3. Keep your answer conversational, clear, and under 4 sentences.
+4. Be specific: mention real numbers, waiting periods, or coverage terms when relevant.
+5. End with one actionable tip or follow-up suggestion.
+6. Do NOT make up policy names, prices, or terms not in the context.
+
+Return ONLY valid JSON:
+{
+  "answer": "your conversational response here",
+  "suggest_policies": true or false
+}
+
+suggest_policies=true only if the user's question is best answered by showing them actual policy recommendations."""
+
+
+def get_chat_reply(question: str, session_policy_ids: list[str] = []) -> dict:
+    """
+    Answer a conversational/educational question in natural language.
+    Searches available policy PDFs for relevant context first.
+    """
+    context_parts: list[str] = []
+
+    for policy_id in session_policy_ids[:2]:
+        try:
+            query_emb = embedder.embed_text(question)
+            chunks = vector_store.section_search(
+                query_emb, policy_id,
+                ["coverage", "conditions", "definitions", "limits", "waiting_periods"],
+                top_k=3,
+            )
+            if chunks:
+                uploaded = vector_store.get_policy_by_id(policy_id)
+                name = uploaded.get("user_label", "Policy") if uploaded else "Policy"
+                context_parts.append(f"[From {name}]\n{_build_context_block(chunks)}")
+        except Exception:
+            continue
+
+    user_msg = f"USER QUESTION: {question}"
+    if context_parts:
+        user_msg = f"CONTEXT BLOCK:\n{'---'.join(context_parts)}\n\n{user_msg}"
+
+    result = llm.chat_json(CHAT_REPLY_SYSTEM, user_msg)
+    return {
+        "answer": result.get("answer", "I'm here to help with health insurance questions. Could you tell me what you're looking for?"),
+        "suggest_policies": result.get("suggest_policies", False),
+    }
 
 
 def _not_found(term: str) -> dict:

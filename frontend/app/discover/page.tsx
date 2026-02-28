@@ -19,7 +19,7 @@ const SESSION_KEY = "policyai_session_id";
 interface Message {
   role: "user" | "assistant";
   content: string;
-  type?: "question" | "results" | "no_results" | "explanation";
+  type?: "question" | "results" | "no_results" | "explanation" | "chat";
   policies?: any[];
   extracted?: any;
   // explanation fields

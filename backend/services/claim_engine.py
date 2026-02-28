@@ -11,6 +11,7 @@ Pipeline:
   7. Return structured result
 """
 from services import llm, vector_store, embedder
+from services.advisor_agent import find_uploaded_for_insurer
 
 CLAIM_SECTIONS = ["exclusions", "coverage", "waiting_periods", "conditions", "limits"]
 
@@ -149,6 +150,26 @@ def run_claim_check(policy_id: str, condition: str, treatment_type: str) -> dict
         or "Unknown Policy"
     )
 
+    # Step 1b: Resolve which UUID to use for chunk search.
+    # Catalog policies (insurance_policies table) have an "insurer" field but NO chunks in
+    # policy_chunks. Chunks are stored under uploaded_policies UUIDs. Map via insurer name.
+    search_policy_id = policy_id  # default: assume it's already an uploaded policy UUID
+    if policy.get("insurer"):
+        # This is a catalog policy — find the matching uploaded PDF
+        uploaded_match = find_uploaded_for_insurer(policy["insurer"])
+        if uploaded_match:
+            search_policy_id = uploaded_match["id"]
+        else:
+            return {
+                "error": (
+                    f"No embedded policy document found for {policy.get('name', 'this policy')} "
+                    f"({policy.get('insurer', '')}). "
+                    "Claim check requires an uploaded and indexed PDF. "
+                    "Currently only Tata AIG policies have embedded documents — "
+                    "please select a Tata AIG policy or upload this policy's PDF first."
+                )
+            }
+
     # Step 2: Embed the condition query
     query_text = f"{condition} {treatment_type} coverage exclusion waiting period"
     try:
@@ -156,13 +177,13 @@ def run_claim_check(policy_id: str, condition: str, treatment_type: str) -> dict
     except Exception as e:
         return {"error": f"Embedding failed: {str(e)}"}
 
-    # Step 3: Section-filtered semantic search
+    # Step 3: Section-filtered semantic search (against uploaded PDF chunks)
     sem_chunks = vector_store.section_search(
-        query_embedding, policy_id, CLAIM_SECTIONS, top_k=6
+        query_embedding, search_policy_id, CLAIM_SECTIONS, top_k=6
     )
 
     # Step 4: Keyword search → post-filter to relevant sections
-    kw_all = vector_store.keyword_search(condition, policy_id, top_k=10)
+    kw_all = vector_store.keyword_search(condition, search_policy_id, top_k=10)
     kw_chunks = [c for c in kw_all if c.get("section_type") in CLAIM_SECTIONS]
 
     # Step 5: RRF fusion → top 8

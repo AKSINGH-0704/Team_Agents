@@ -12,6 +12,7 @@ from services import vector_store
 from services.claim_engine import run_claim_check
 from services.skills import HiddenConditionsDetector, CoverageGapScanner
 from services.medical_extractor import extract_from_text, extract_from_pdf_bytes, match_conditions_to_exclusions
+from services.advisor_agent import find_uploaded_for_insurer, get_rag_insights
 
 router = APIRouter(prefix="/api", tags=["claim"])
 gap_scanner = CoverageGapScanner()
@@ -111,6 +112,22 @@ async def gap_analysis(policy_id: str):
         gaps = gap_scanner.scan(catalog_policy)
         severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
         gaps.sort(key=lambda g: severity_order.get(g["severity"], 3))
+
+        # RAG enrichment: find the uploaded PDF for this insurer → surface hidden conditions
+        rag_hidden: list[dict] = []
+        rag_available = False
+        uploaded = find_uploaded_for_insurer(catalog_policy.get("insurer", ""))
+        if uploaded:
+            rag_available = True
+            gap_needs = [
+                "room rent", "co-pay", "waiting period", "sub-limit",
+                "exclusion", "pre-authorization", "proportional deduction",
+                "co-payment", "deductible", "network hospital",
+            ]
+            insights = get_rag_insights(uploaded["id"], gap_needs)
+            if insights.get("available") and insights.get("hidden_traps"):
+                rag_hidden = insights["hidden_traps"]
+
         return {
             "policy_name": catalog_policy.get("name"),
             "insurer": catalog_policy.get("insurer"),
@@ -118,6 +135,8 @@ async def gap_analysis(policy_id: str):
             "gaps": gaps,
             "gap_count": len(gaps),
             "high_risk_count": sum(1 for g in gaps if g["severity"] == "HIGH"),
+            "hidden_conditions": rag_hidden,
+            "rag_available": rag_available,
         }
 
     uploaded = vector_store.get_policy_by_id(policy_id)

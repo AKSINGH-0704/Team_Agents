@@ -16,6 +16,7 @@ from services.advisor_agent import (
     find_uploaded_for_insurer,
     get_rag_insights,
     explain_term,
+    get_chat_reply,
 )
 
 router = APIRouter(prefix="/api", tags=["discovery"])
@@ -129,12 +130,20 @@ async def discover_chat(req: DiscoverChatRequest):
         or not intent_result.get("has_members")
         or not intent_result.get("has_needs_or_conditions")
     )
-    if intent == "gather_info" or (missing_any and intent not in ("explain_term", "explain_policy")):
+    if intent == "gather_info" or (missing_any and intent not in ("explain_term", "explain_policy", "chat_reply")):
         question = (
             intent_result.get("next_question")
             or "Could you tell me your health coverage needs, annual budget, and how many family members need coverage?"
         )
         return {"type": "question", "message": question}
+
+    # ── MODE CHAT: conversational / educational questions ─────────────────────
+    if intent == "chat_reply":
+        last_user = next(
+            (m["content"] for m in reversed(req.messages) if m["role"] == "user"), ""
+        )
+        reply = get_chat_reply(last_user, req.session_policy_ids)
+        return {"type": "chat", "message": reply["answer"]}
 
     # ── MODE EXPLAIN: user asked about a term or specific policy ─────────────
     if intent in ("explain_term", "explain_policy"):

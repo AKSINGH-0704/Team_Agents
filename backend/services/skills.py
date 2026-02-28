@@ -276,19 +276,42 @@ class PolicyRanker:
         Score starts at 0. Each factor adds or subtracts.
         Clamped to [0, 100].
 
-        Points:
-          +30  maternity covered (if requested)
-          +25  pre-existing conditions not in exclusions (if preexisting provided)
+        Coverage needs (when explicitly requested, these score HEAVILY):
+          +30  maternity covered
+          +20  OPD covered / -12 if not
+          +15  mental_health covered / -8 if not
+          +12  AYUSH covered / -8 if not
+          +12  dental covered / -8 if not
+          +12  NCB >= 50% / +6 if any NCB
+          +15  restoration explicitly requested + covered / -10 if not
+          + 5  restoration passively present (not requested)
+
+        Pre-existing conditions:
+          +25  NOT in exclusion list
+          -20  explicitly in exclusion list
+
+        Budget fit:
           +20  premium_min <= budget
+          + 5  premium_min <= budget × 0.65 (exceptional value)
+
+        Members / plan type fit:
+          + 8  family_floater AND members >= 3
+          + 5  individual AND members == 1
+
+        Sum insured:
+          +10  sum_insured_max >= sum_insured_min requirement
+          -15  sum_insured_max < requirement
+
+        Network:
           +10  network_hospitals > 5000
-          +10  waiting_period_preexisting_years <= 2
-          + 5  restoration_benefit = true
-          + 5  opd covered (if requested)
-          - 5  opd requested but not covered
-          -10  co_pay_percent > 0
+
+        Waiting period:
+          +10  PED wait <= 2 years
+          -15  PED wait >= 4 years
+
+        Penalties:
+          -10  co_pay > 0
           -10  room_rent_limit contains "%" (proportional deduction risk)
-          -15  waiting_period_preexisting_years >= 4
-          -20  policy explicitly excludes a requested pre-existing condition
         """
         score = 0
         why: list[str] = []
@@ -297,8 +320,11 @@ class PolicyRanker:
         budget = req.get("budget_max")
         preexisting = req.get("preexisting_conditions") or []
         exclusions = [e.lower() for e in (policy.get("exclusions") or [])]
+        members = req.get("members")
+        si_min = req.get("sum_insured_min")
 
-        # Maternity
+        # ── Coverage needs (heavily weighted when explicitly requested) ──────────
+
         if "maternity" in needs:
             if policy.get("covers_maternity"):
                 score += 30
@@ -306,22 +332,64 @@ class PolicyRanker:
             else:
                 tradeoffs.append("Maternity not covered")
 
-        # OPD
         if "opd" in needs:
             if policy.get("covers_opd"):
-                score += 5
+                score += 20
                 why.append("OPD coverage included")
             else:
-                score -= 5
+                score -= 12
                 tradeoffs.append("OPD not covered")
 
-        # Mental health
         if "mental_health" in needs:
             if policy.get("covers_mental_health"):
-                score += 5
-                why.append("Mental health coverage")
+                score += 15
+                why.append("Mental health coverage included")
+            else:
+                score -= 8
+                tradeoffs.append("Mental health not covered")
 
-        # Pre-existing conditions
+        if "ayush" in needs:
+            if policy.get("covers_ayush"):
+                score += 12
+                why.append("AYUSH/alternative medicine covered")
+            else:
+                score -= 8
+                tradeoffs.append("AYUSH not covered")
+
+        if "dental" in needs:
+            if policy.get("covers_dental"):
+                score += 12
+                why.append("Dental coverage included")
+            else:
+                score -= 8
+                tradeoffs.append("Dental not covered")
+
+        if "ncb" in needs:
+            ncb = policy.get("ncb_percent", 0)
+            if ncb >= 50:
+                score += 12
+                why.append(f"{ncb}% No Claim Bonus — great long-term value")
+            elif ncb > 0:
+                score += 6
+                why.append(f"{ncb}% No Claim Bonus")
+            else:
+                score -= 5
+                tradeoffs.append("No NCB benefit")
+
+        if "restoration" in needs:
+            if policy.get("restoration_benefit"):
+                score += 15
+                why.append("Sum insured restoration benefit")
+            else:
+                score -= 10
+                tradeoffs.append("No restoration benefit")
+        elif policy.get("restoration_benefit"):
+            # Passively good feature even if not requested
+            score += 5
+            why.append("Sum insured restored after claim")
+
+        # ── Pre-existing conditions ──────────────────────────────────────────────
+
         if preexisting:
             excluded_any = any(
                 any(word in excl for word in cond.lower().split() if len(word) > 3)
@@ -341,22 +409,53 @@ class PolicyRanker:
                 )
                 tradeoffs.append(f"'{hit}' may be excluded — verify policy wording")
 
-        # Budget
+        # ── Budget fit ───────────────────────────────────────────────────────────
+
         if budget:
             prem_min = policy.get("premium_min", 0)
             if prem_min <= budget:
                 score += 20
                 why.append(f"Premium from ₹{prem_min:,}/yr (within ₹{budget:,} budget)")
+                if prem_min <= budget * 0.65:
+                    score += 5
+                    why.append("Excellent value for your budget")
             else:
                 tradeoffs.append(f"Lowest premium ₹{prem_min:,}/yr exceeds budget")
 
-        # Network
+        # ── Members / plan type fit ──────────────────────────────────────────────
+
+        if members:
+            try:
+                m = int(members)
+                if m >= 3 and policy.get("type") == "family_floater":
+                    score += 8
+                    why.append("Family floater — covers your whole family under one premium")
+                elif m == 1 and policy.get("type") == "individual":
+                    score += 5
+                    why.append("Individual plan — right fit for single coverage")
+            except (ValueError, TypeError):
+                pass
+
+        # ── Sum insured requirement ──────────────────────────────────────────────
+
+        if si_min:
+            si_max = policy.get("sum_insured_max", 0)
+            if si_max >= si_min:
+                score += 10
+                why.append(f"Sum insured up to ₹{si_max // 100000:.0f}L available")
+            else:
+                score -= 15
+                tradeoffs.append(f"Max sum insured ₹{si_max // 100000:.0f}L may not meet your ₹{si_min // 100000:.0f}L requirement")
+
+        # ── Network hospitals ────────────────────────────────────────────────────
+
         network = policy.get("network_hospitals", 0)
         if network > 5000:
             score += 10
             why.append(f"{network:,} network hospitals")
 
-        # Waiting period
+        # ── Waiting period ───────────────────────────────────────────────────────
+
         ped = policy.get("waiting_period_preexisting_years", 4)
         if ped <= 2:
             score += 10
@@ -365,18 +464,13 @@ class PolicyRanker:
             score -= 15
             tradeoffs.append(f"Long {ped}-year pre-existing waiting period")
 
-        # Restoration
-        if policy.get("restoration_benefit"):
-            score += 5
-            why.append("Sum insured restored after claim")
+        # ── Penalties ────────────────────────────────────────────────────────────
 
-        # Co-pay penalty
         copay = policy.get("co_pay_percent", 0)
         if copay and copay > 0:
             score -= 10
             tradeoffs.append(f"{copay}% co-payment on every claim")
 
-        # Room rent proportional deduction risk
         room = policy.get("room_rent_limit") or ""
         if room and "%" in room:
             score -= 10
